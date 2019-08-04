@@ -55,7 +55,7 @@ import           Database.SQLite.Simple.Types (Null)
 import           Control.Exception (SomeException(..), bracket_, onException, mask)
 import           Control.Monad (forM_)
 import           Control.Monad.Fail (MonadFail)
-import           Control.Monad.Free.Church
+import           Control.Applicative.Free.Final
 import           Control.Monad.IO.Class (MonadIO(..))
 import           Control.Monad.Identity (Identity)
 import           Control.Monad.Reader (ReaderT(..), MonadReader(..), runReaderT)
@@ -133,15 +133,22 @@ instance FromBackendRow Sqlite TL.Text
 instance FromBackendRow Sqlite UTCTime
 instance FromBackendRow Sqlite Day
 instance FromBackendRow Sqlite Null
+
 instance FromBackendRow Sqlite Char where
-  fromBackendRow = do
-    t <- fromBackendRow
-    case T.uncons t of
-      Just (c, _) -> pure c
-      _ -> fail "Need string of size one to parse Char"
+  fromBackendRow = unSqliteChar <$> fromBackendRow
+instance FromBackendRow Sqlite SqliteChar
+
+newtype SqliteChar = SqliteChar { unSqliteChar :: Char }
+instance FromField SqliteChar where
+  fromField f = do
+    t <- fromField f :: Ok TL.Text
+    case TL.uncons t of
+      Just (c, _) -> Ok $ SqliteChar c
+      _ -> returnError ConversionFailed f "Need string of size one to parse Char"
+
 instance FromBackendRow Sqlite SqlNull where
   fromBackendRow =
-    SqlNull <$ (fromBackendRow :: FromBackendRowM Sqlite Null)
+    SqlNull <$ (fromBackendRow :: FromBackendRowA Sqlite Null)
 instance FromBackendRow Sqlite LocalTime where
   fromBackendRow = utcToLocalTime utc <$> fromBackendRow
 instance FromBackendRow Sqlite Scientific where
@@ -193,9 +200,9 @@ instance ToRow BeamSqliteParams where
 
 newtype BeamSqliteRow a = BeamSqliteRow a
 instance FromBackendRow Sqlite a => FromRow (BeamSqliteRow a) where
-  fromRow = BeamSqliteRow <$> runF fromBackendRow' finish step
+  fromRow = BeamSqliteRow <$> runAp step fromBackendRow'
       where
-        FromBackendRowM fromBackendRow' = fromBackendRow :: FromBackendRowM Sqlite a
+        FromBackendRowA fromBackendRow' = fromBackendRow :: FromBackendRowA Sqlite a
 
         translateErrors :: Maybe Int -> SomeException -> Maybe SomeException
         translateErrors col (SomeException e) =
@@ -212,30 +219,28 @@ instance FromBackendRow Sqlite a => FromRow (BeamSqliteRow a) where
               Just (SomeException (BeamRowReadError col (ColumnTypeMismatch hsString typeString ("incompatible: " ++ msg))))
             Nothing -> Nothing
 
-        finish = pure
-
-        step :: forall a'. FromBackendRowF Sqlite (RowParser a') -> RowParser a'
+        step :: forall a'. FromBackendRowF Sqlite a' -> RowParser a'
         step (ParseOneField next) =
             RP $ ReaderT $ \ro -> StateT $ \st@(col, _) ->
             case runStateT (runReaderT (unRP field) ro) st of
-              Ok (x, st') -> runStateT (runReaderT (unRP (next x)) ro) st'
+              Ok (x, st') -> runStateT (runReaderT (pure $ next x) ro) st'
               Errors errs -> Errors (mapMaybe (translateErrors (Just col)) errs)
-        step (Alt (FromBackendRowM a) (FromBackendRowM b) next) = do
+        step (Alt (FromBackendRowA a) (FromBackendRowA b) next) = do
           RP $ do
-            let RP a' = runF a finish step
-                RP b' = runF b finish step
+            let RP a' = runAp step a
+                RP b' = runAp step b
 
             st <- get
             ro <- ask
             case runStateT (runReaderT a' ro) st of
               Ok (ra, st') -> do
                 put st'
-                unRP (next ra)
+                pure (next ra)
               Errors aErrs ->
                 case runStateT (runReaderT b' ro) st of
                   Ok (rb, st') -> do
                     put st'
-                    unRP (next rb)
+                    pure (next rb)
                   Errors bErrs ->
                     lift (lift (Errors (aErrs ++ bErrs)))
         step (FailParseWith err) = RP (lift (lift (Errors [SomeException err])))

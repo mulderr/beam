@@ -24,13 +24,15 @@ module Database.Beam.Postgres.Connection
   , postgresUriSyntax ) where
 
 import           Control.Exception (SomeException(..), throwIO)
+import           Control.Applicative.Free.Final
 import           Control.Monad.Free.Church
 import           Control.Monad.IO.Class
 
 import           Database.Beam hiding (runDelete, runUpdate, runInsert, insert)
 import           Database.Beam.Backend.SQL.BeamExtensions
-import           Database.Beam.Backend.SQL.Row ( FromBackendRowF(..), FromBackendRowM(..)
-                                               , BeamRowReadError(..), ColumnParseError(..) )
+import           Database.Beam.Backend.SQL.Row ( FromBackendRowF(..), FromBackendRowA(..)
+                                               , BeamRowReadError(..), ColumnParseError(..)
+                                               , valuesNeeded' )
 import           Database.Beam.Backend.URI
 import           Database.Beam.Query.Types (QGenExpr(..))
 import           Database.Beam.Schema.Tables
@@ -55,6 +57,7 @@ import           Control.Monad.Reader
 import           Control.Monad.State
 import           Control.Monad.Fail (MonadFail)
 import qualified Control.Monad.Fail as Fail
+import           Control.Monad.Trans.Except
 
 import           Data.ByteString (ByteString)
 import           Data.ByteString.Builder (toLazyByteString, byteString)
@@ -128,14 +131,59 @@ getFields res = do
 
   mapM getField [0..colCount - 1]
 
+
+runPgRowReader
+  :: forall a. Pg.Connection
+  -> Pg.Row
+  -> Pg.Result
+  -> [Pg.Field]
+  -> FromBackendRowA Postgres a
+  -> IO (Either BeamRowReadError a)
+runPgRowReader conn rowIdx res fields readRowA@(FromBackendRowA readRow) = do
+  (Pg.Col colCount) <- Pg.nfields res
+  let needCols = fromIntegral $ valuesNeeded' readRowA
+  if needCols <= colCount
+    then runExceptT $ evalStateT (runAp step readRow) $ zip [0..(colCount - 1)] fields
+    else pure $ Left $ BeamRowReadError (Just $ fromIntegral colCount) (ColumnNotEnoughColumns $ fromIntegral needCols)
+  where
+    step :: FromBackendRowF Postgres x -> StateT [(CInt, Pg.Field)] (ExceptT BeamRowReadError IO) x
+    step (ParseOneField next) = do
+      (curCol, field):fs <- get
+      put fs
+      fv <- liftIO $ Pg.getvalue res rowIdx (Pg.Col curCol)
+      case fv of
+        Nothing -> lift $ throwE $ BeamRowReadError (Just $ fromIntegral curCol) ColumnUnexpectedNull
+        Just _ -> do
+          r <- liftIO $ Pg.runConversion (Pg.fromField field fv) conn
+          case r of
+            Pg.Ok x -> pure $ next x
+            Pg.Errors _ -> lift $ throwE $ BeamRowReadError (Just $ fromIntegral curCol) (ColumnTypeMismatch "" "" "") -- TODO: !!!
+    step (Alt f g next) = do
+      (curCol, field):fs <- get
+      put fs
+      fv <- liftIO $ Pg.getvalue res rowIdx (Pg.Col curCol)
+      case fv of
+        Nothing -> lift $ throwE $ BeamRowReadError (Just $ fromIntegral curCol) ColumnUnexpectedNull
+        Just _ -> do
+          rf <- liftIO $ runPgRowReader conn rowIdx res fields f
+          case rf of
+            Right x -> pure $ next x
+            Left err1 -> do
+              gr <- liftIO $ runPgRowReader conn rowIdx res fields g
+              case gr of
+                Right x -> pure $ next x
+                Left err2 -> lift $ throwE err1 >> throwE err2
+    step (FailParseWith err) = lift $ throwE err
+
+{-
 runPgRowReader ::
-  Pg.Connection -> Pg.Row -> Pg.Result -> [Pg.Field] -> FromBackendRowM Postgres a -> IO (Either BeamRowReadError a)
-runPgRowReader conn rowIdx res fields (FromBackendRowM readRow) =
+  Pg.Connection -> Pg.Row -> Pg.Result -> [Pg.Field] -> FromBackendRowA Postgres a -> IO (Either BeamRowReadError a)
+runPgRowReader conn rowIdx res fields (FromBackendRowA readRow) =
   Pg.nfields res >>= \(Pg.Col colCount) ->
-  runF readRow finish step 0 colCount fields
+  runAp step todo2 -- readRow finish step 0 colCount fields
   where
 
-    step :: forall x. FromBackendRowF Postgres (CInt -> CInt -> [PgI.Field] -> IO (Either BeamRowReadError x))
+    step :: forall x. FromBackendRowF Postgres (CInt -> CInt -> [PgI.Field]) -> IO (Either BeamRowReadError x)
          -> CInt -> CInt -> [PgI.Field] -> IO (Either BeamRowReadError x)
     step (ParseOneField _) curCol colCount [] = pure (Left (BeamRowReadError (Just (fromIntegral curCol)) (ColumnNotEnoughColumns (fromIntegral colCount))))
     step (ParseOneField _) curCol colCount _
@@ -163,7 +211,7 @@ runPgRowReader conn rowIdx res fields (FromBackendRowM readRow) =
              in pure (Left (BeamRowReadError (Just (fromIntegral curCol)) err))
            Pg.Ok x -> next' x (curCol + 1) colCount remainingFields
 
-    step (Alt (FromBackendRowM a) (FromBackendRowM b) next) curCol colCount cols =
+    step (Alt (FromBackendRowA a) (FromBackendRowA b) next) curCol colCount cols =
       do aRes <- runF a (\x curCol' colCount' cols' -> pure (Right (next x curCol' colCount' cols'))) step curCol colCount cols
          case aRes of
            Right next' -> next'
@@ -177,6 +225,7 @@ runPgRowReader conn rowIdx res fields (FromBackendRowM readRow) =
       pure (Left err)
 
     finish x _ _ _ = pure (Right x)
+-}
 
 withPgDebug :: (String -> IO ()) -> Pg.Connection -> Pg a -> IO (Either BeamRowReadError a)
 withPgDebug dbg conn (Pg action) =

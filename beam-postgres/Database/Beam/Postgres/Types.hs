@@ -23,6 +23,7 @@ import qualified Database.PostgreSQL.Simple.Types as Pg
 import qualified Database.PostgreSQL.Simple.Range as Pg (PGRange)
 import qualified Database.PostgreSQL.Simple.Time as Pg (Date, UTCTimestamp, ZonedTimestamp, LocalTimestamp)
 
+import           Control.Applicative ((<|>))
 import           Data.Aeson (Value)
 import           Data.ByteString (ByteString)
 import qualified Data.ByteString.Lazy as BL
@@ -54,7 +55,8 @@ instance HasSqlInTable Postgres where
 instance Pg.FromField SqlNull where
   fromField field d = fmap (\Pg.Null -> SqlNull) (Pg.fromField field d)
 
-fromScientificOrIntegral :: (Bounded a, Integral a) => FromBackendRowM Postgres a
+{-
+fromScientificOrIntegral :: (Bounded a, Integral a) => FromBackendRowA Postgres a
 fromScientificOrIntegral = do
   sciVal <- fmap (toBoundedInteger =<<) peekField
   case sciVal of
@@ -66,7 +68,7 @@ fromScientificOrIntegral = do
 -- type, but only if we won't lose data
 fromPgIntegral :: forall a
                 . (Pg.FromField a, Integral a, Typeable a)
-               => FromBackendRowM Postgres a
+               => FromBackendRowA Postgres a
 fromPgIntegral = do
   val <- peekField
   case val of
@@ -79,6 +81,24 @@ fromPgIntegral = do
         then pure val''
         else fail (concat [ "Data loss while downsizing Integral type. "
                           , "Make sure your Haskell types are wide enough for your data" ])
+-}
+
+-- TODO
+fromScientificOrIntegral :: (Bounded a, Integral a) => FromBackendRowA Postgres a
+fromScientificOrIntegral = do
+  fromIntegral <$> fromBackendRow @Postgres @Integer
+
+-- TODO
+newtype PgIntegral a = PgIntegral { unPgIntegral :: a }
+instance Pg.FromField a => Pg.FromField (PgIntegral a) where
+  fromField field d = do
+    x <- Pg.fromField field d :: Pg.Conversion a
+    pure $ PgIntegral x
+
+fromPgIntegral :: forall a
+                . (Pg.FromField a, Integral a, Typeable a)
+               => FromBackendRowA Postgres a
+fromPgIntegral = unPgIntegral <$> parseOneField
 
 -- Default FromBackendRow instances for all postgresql-simple FromField instances
 instance FromBackendRow Postgres SqlNull
@@ -113,7 +133,7 @@ instance FromBackendRow Postgres Value
 instance FromBackendRow Postgres TL.Text
 instance FromBackendRow Postgres Pg.Oid
 instance FromBackendRow Postgres LocalTime where
-  fromBackendRow =
+  {-fromBackendRow =
     peekField >>=
     \case
       Just (x :: LocalTime) -> pure x
@@ -126,6 +146,10 @@ instance FromBackendRow Postgres LocalTime where
         \case
           Just (x :: ZonedTime) -> pure (zonedTimeToLocalTime x)
           Nothing -> fail "'TIMESTAMP WITH TIME ZONE' or 'TIMESTAMP WITHOUT TIME ZONE' required for LocalTime"
+  -}
+  fromBackendRow = parseOneField
+               <|> (zonedTimeToLocalTime <$> parseOneField)
+               <|> failParse "'TIMESTAMP WITH TIME ZONE' or 'TIMESTAMP WITHOUT TIME ZONE' required for LocalTime"
 instance FromBackendRow Postgres TimeOfDay
 instance FromBackendRow Postgres Day
 instance FromBackendRow Postgres UUID
@@ -141,11 +165,13 @@ instance FromBackendRow Postgres (Ratio Integer)
 instance FromBackendRow Postgres (CI Text)
 instance FromBackendRow Postgres (CI TL.Text)
 instance (Pg.FromField a, Typeable a) => FromBackendRow Postgres (Vector a) where
-  fromBackendRow = do
+  {-fromBackendRow = do
       isNull <- peekField
       case isNull of
         Just SqlNull -> pure mempty
-        Nothing -> parseOneField @Postgres @(Vector a)
+        Nothing -> parseOneField @Postgres @(Vector a)-}
+  fromBackendRow = parseOneField
+               <|> (mempty <$ parseOneField @Postgres @SqlNull)
 instance (Pg.FromField a, Typeable a) => FromBackendRow Postgres (Pg.PGArray a)
 instance FromBackendRow Postgres (Pg.Binary ByteString)
 instance FromBackendRow Postgres (Pg.Binary BL.ByteString)

@@ -177,15 +177,16 @@ instance Pg.FromField PgRawString where
     fromField f Nothing = Pg.returnError Pg.UnexpectedNull f "When parsing enumeration string"
     fromField _ (Just d) = pure (PgRawString (BC.unpack d))
 
+-- TODO
 pgParseEnum :: (Enum a, Bounded a) => (a -> String)
-            -> FromBackendRowM Postgres a
-pgParseEnum namer =
-  let allNames = map (\x -> (namer x, x)) [minBound..maxBound]
-  in do
-    PgRawString name <- fromBackendRow
-    case lookup name allNames of
-      Nothing -> fail ("Invalid postgres enumeration value: " ++ name)
-      Just  v -> pure v
+            -> FromBackendRowA Postgres a
+pgParseEnum namer = failParse "TODO: pgParseEnum"
+  -- let allNames = map (\x -> (namer x, x)) [minBound..maxBound]
+  -- in do
+  --   PgRawString name <- fromBackendRow
+  --   case lookup name allNames of
+  --     Nothing -> fail ("Invalid postgres enumeration value: " ++ name)
+  --     Just  v -> pure v
 
 beamTypeForCustomPg :: CheckedDatabaseEntity Postgres db (PgType a) -> DataType Postgres a
 beamTypeForCustomPg (CheckedDatabaseEntity (CheckedPgTypeDescriptor (PgTypeDescriptor _ _ dt) _) _)
